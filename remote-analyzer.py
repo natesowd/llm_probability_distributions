@@ -204,7 +204,14 @@ def convert_history_to_csv():
 with st.sidebar:
     st.header("⚙️ Configuration")
 
-    api_key = st.text_input("Cerebras API Key", type="password")
+    # api_key = st.text_input("Cerebras API Key", type="password")
+    # Using secrets instead for security/convenience
+    if "CEREBRAS_API_KEY" in st.secrets:
+        api_key = st.secrets["CEREBRAS_API_KEY"]
+    else:
+        st.error("CEREBRAS_API_KEY not found in secrets.")
+        st.stop()
+
     model_name = st.text_input("Model Name", value=DEFAULT_MODEL)
 
     st.divider()
@@ -261,11 +268,8 @@ if not st.session_state.context_locked:
     )
 
     if st.button("🚀 Lock & Start", type="primary"):
-        if not api_key:
-            st.error("Please enter an API Key in the sidebar.")
-        else:
-            st.session_state.context_locked = True
-            st.rerun()
+        st.session_state.context_locked = True
+        st.rerun()
 
 # 2. Interactive Phase
 else:
@@ -294,10 +298,6 @@ else:
 
     # --- B. Analysis Engine ---
     st.markdown("### 🔍 Next Token Analysis")
-
-    if not api_key:
-        st.error("API Key missing.")
-        st.stop()
 
     # Auto-Fetch Analysis if needed
     if st.session_state.current_analysis is None:
