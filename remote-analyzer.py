@@ -19,7 +19,7 @@ if "current_analysis" not in st.session_state:
 if "context_locked" not in st.session_state:
     st.session_state.context_locked = False
 if "system_prompt" not in st.session_state:
-    st.session_state.system_prompt = "You are a helpful assistant."
+    st.session_state.system_prompt = ""
 if "user_prompt" not in st.session_state:
     st.session_state.user_prompt = "Write a headline for a long form journalistic article about AI ethics agreement reached across the EU."
 if "word_mode" not in st.session_state:
