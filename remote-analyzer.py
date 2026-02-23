@@ -22,8 +22,21 @@ if "system_prompt" not in st.session_state:
     st.session_state.system_prompt = "You are a helpful assistant."
 if "user_prompt" not in st.session_state:
     st.session_state.user_prompt = "Write a headline for a long form journalistic article about AI ethics agreement reached across the EU."
+if "word_mode" not in st.session_state:
+    st.session_state.word_mode = True
 
 # --- Helper Functions ---
+
+
+def is_continuation(token):
+    """Checks if a token is a continuation of a word (no leading space/newline)."""
+    if not token:
+        return False
+    # Llama 3 tokens typically start with a space ' ' for new words.
+    # Other boundaries include newlines and tabs.
+    return not (
+        token.startswith(" ") or token.startswith("\n") or token.startswith("\t")
+    )
 
 
 def get_client(api_key):
@@ -53,48 +66,72 @@ def build_full_prompt_debug():
 
 def analyze_next_step(api_key, model, temp, top_p, top_k):
     """
-    Runs inference for 1 token to 'peek' at the probabilities.
-    Uses Text Completion API to ensure proper continuation.
+    Runs inference to 'peek' at probabilities.
+    If word_mode is enabled, it looksahead to complete the word.
     """
     client = get_client(api_key)
     full_prompt = build_llama_prompt()
 
     try:
+        # If in word mode, we peek ahead multiple tokens to find the word boundary
+        max_tokens = 10 if st.session_state.word_mode else 1
+
         response = client.completions.create(
             model=model,
             prompt=full_prompt,
-            max_tokens=1,
-            logprobs=20,  # In Completions API, this is an int
+            max_tokens=max_tokens,
+            logprobs=20,
             temperature=temp,
             top_p=top_p,
-            # extra_body={"top_k": top_k},
         )
 
         choice = response.choices[0]
-        predicted_token = choice.text
-        # In Completions, logprobs is a wrapper object, top_logprobs is a list of dicts
-        # We want the first position's top logprobs
-        top_dict = choice.logprobs.top_logprobs[0]
 
-        # Convert dict to expected object structure (or list of objects) for consistency?
-        # The existing UI expects objects with .token and .logprob attributes
-        # top_dict is {token: logprob, ...}
-
-        # Correction: check OpenAI python lib structure for Completions.
-        # It usually returns dict {token: logprob}.
-        # But UI expects object with .token and .logprob.
-        # Let's create a simple shim class.
-
+        # Helper class shim
         class TokenProb:
             def __init__(self, token, logprob):
                 self.token = token
                 self.logprob = logprob
 
-        candidates = []
-        for t, lp in top_dict.items():
-            candidates.append(TokenProb(t, lp))
+        if st.session_state.word_mode and choice.logprobs:
+            tokens = choice.logprobs.tokens
+            top_logprobs_list = choice.logprobs.top_logprobs
 
-        # Sort by logprob desc
+            # Build predicted_token by following the greedy path until a word boundary
+            word_tokens = []
+            for i, t in enumerate(tokens):
+                if i > 0 and not is_continuation(t):
+                    break
+                word_tokens.append(t)
+            predicted_token = "".join(word_tokens)
+
+            # For each top candidate at position 0, complete it to a full word
+            # by appending continuation tokens from the greedy sequence.
+            # The greedy suffix (tokens[1:]) is the best available approximation
+            # of what follows each candidate first-token.
+            greedy_suffix = []
+            for t in tokens[1:]:
+                if not is_continuation(t):
+                    break
+                greedy_suffix.append(t)
+
+            top_dict = top_logprobs_list[0]
+            candidates = []
+            for t, lp in top_dict.items():
+                if is_continuation(t):
+                    # Candidate is a continuation fragment — complete it with the greedy suffix
+                    completed = t + "".join(greedy_suffix)
+                else:
+                    # Candidate starts a new word (has leading space/newline) — use as-is
+                    completed = t
+                candidates.append(TokenProb(completed, lp))
+        else:
+            predicted_token = choice.text
+            top_dict = choice.logprobs.top_logprobs[0]
+            candidates = []
+            for t, lp in top_dict.items():
+                candidates.append(TokenProb(t, lp))
+
         candidates.sort(key=lambda x: x.logprob, reverse=True)
 
         st.session_state.current_analysis = {
@@ -109,11 +146,16 @@ def analyze_next_step(api_key, model, temp, top_p, top_k):
 def fast_forward(api_key, model, temp, top_p, top_k, num_tokens):
     full_prompt = build_llama_prompt()
     client = get_client(api_key)
+
+    # In word mode, we might need more actual tokens to satisfy the 'num_tokens' as words
+    # but for now, we'll keep the request limit simple.
+    actual_max_tokens = num_tokens if not st.session_state.word_mode else num_tokens * 3
+
     try:
         response = client.completions.create(
             model=model,
             prompt=full_prompt,
-            max_tokens=num_tokens,
+            max_tokens=actual_max_tokens,
             logprobs=5,  # Minimal logprobs for history
             temperature=temp,
             top_p=top_p,
@@ -121,10 +163,6 @@ def fast_forward(api_key, model, temp, top_p, top_k, num_tokens):
         )
 
         if response.choices[0].logprobs:
-            # Complicated parsing for completion logprobs
-            # response.choices[0].logprobs.top_logprobs is a list of dicts {token: lp}
-            # response.choices[0].logprobs.tokens is a list of chosen tokens
-
             c = response.choices[0]
             tokens = c.logprobs.tokens
             top_logprobs_list = c.logprobs.top_logprobs
@@ -135,6 +173,9 @@ def fast_forward(api_key, model, temp, top_p, top_k, num_tokens):
                     self.token = token
                     self.logprob = logprob
 
+            current_word_tokens = []
+            current_word_cands = []
+
             for i, token_str in enumerate(tokens):
                 # top_logprobs_list[i] is a dict {token: lp}
                 # We need to convert it to a list of TokenProb objects
@@ -144,8 +185,35 @@ def fast_forward(api_key, model, temp, top_p, top_k, num_tokens):
                         current_cands.append(TokenProb(t, lp))
                     current_cands.sort(key=lambda x: x.logprob, reverse=True)
 
+                if st.session_state.word_mode:
+                    # Grouping logic
+                    if i > 0 and not is_continuation(token_str) and current_word_tokens:
+                        # Commit the previous word
+                        st.session_state.history.append(
+                            {
+                                "token": "".join(current_word_tokens),
+                                "candidates": current_word_cands,
+                            }
+                        )
+                        current_word_tokens = []
+                        current_word_cands = []
+
+                    current_word_tokens.append(token_str)
+                    if not current_word_cands:
+                        current_word_cands = current_cands
+                else:
+                    # Token mode
+                    st.session_state.history.append(
+                        {"token": token_str, "candidates": current_cands}
+                    )
+
+            # Final word commit if in word mode
+            if st.session_state.word_mode and current_word_tokens:
                 st.session_state.history.append(
-                    {"token": token_str, "candidates": current_cands}
+                    {
+                        "token": "".join(current_word_tokens),
+                        "candidates": current_word_cands,
+                    }
                 )
 
         st.session_state.current_analysis = None
@@ -192,8 +260,7 @@ def convert_history_to_csv():
                     "Chosen_Token_At_Step": chosen,
                     "Candidate_Token": cand.token,
                     "Rank": rank + 1,
-                    "Probability": prob,
-                    "Log_Probability": cand.logprob,
+                    "Probability": round(prob, 2),
                     "Is_Actual_Choice": (cand.token == chosen),
                 }
             )
@@ -228,6 +295,14 @@ with st.sidebar:
         0,
         5,
         help="Limit to top K tokens (Currently unsupported for Cerebras)",
+    )
+
+    st.divider()
+    st.subheader("Display & Mode")
+    st.session_state.word_mode = st.toggle(
+        "Word Mode",
+        value=st.session_state.word_mode,
+        help="Group sub-tokens into full words. Prevents fragments like 'Ag' + 'rees'.",
     )
 
     st.divider()
