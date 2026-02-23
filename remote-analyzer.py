@@ -19,11 +19,24 @@ if "current_analysis" not in st.session_state:
 if "context_locked" not in st.session_state:
     st.session_state.context_locked = False
 if "system_prompt" not in st.session_state:
-    st.session_state.system_prompt = ""
+    st.session_state.system_prompt = "You are a helpful assistant."
 if "user_prompt" not in st.session_state:
     st.session_state.user_prompt = "Write a headline for a long form journalistic article about AI ethics agreement reached across the EU."
 if "word_mode" not in st.session_state:
     st.session_state.word_mode = True
+if "custom_token_key" not in st.session_state:
+    st.session_state.custom_token_key = 0
+if "temp_val" not in st.session_state:
+    st.session_state.temp_val = 1.0
+if "top_p_val" not in st.session_state:
+    st.session_state.top_p_val = 1.0
+if "top_k_val" not in st.session_state:
+    st.session_state.top_k_val = 0
+
+# --- Defaults ---
+DEFAULT_TEMP = 1.0
+DEFAULT_TOP_P = 1.0
+DEFAULT_TOP_K = 0
 
 # --- Helper Functions ---
 
@@ -40,6 +53,33 @@ def is_continuation(token):
 
 
 def get_client(api_key):
+    return OpenAI(base_url=CEREBRAS_BASE_URL, api_key=api_key)
+
+
+def apply_sampling_filters(candidates, top_p, top_k):
+    """
+    Apply top-p (nucleus) and top-k filters to a sorted list of TokenProb objects.
+    Candidates must already be sorted descending by logprob.
+    Returns filtered list.
+    """
+    # Apply top-k first
+    if top_k and top_k > 0:
+        candidates = candidates[:top_k]
+
+    # Apply top-p (nucleus sampling): keep tokens whose cumulative probability <= top_p
+    if top_p and top_p < 1.0:
+        filtered = []
+        cumulative = 0.0
+        for c in candidates:
+            prob = math.exp(c.logprob)
+            if cumulative >= top_p:
+                break
+            filtered.append(c)
+            cumulative += prob
+        candidates = filtered
+
+    return candidates
+
     return OpenAI(base_url=CEREBRAS_BASE_URL, api_key=api_key)
 
 
@@ -133,10 +173,13 @@ def analyze_next_step(api_key, model, temp, top_p, top_k):
                 candidates.append(TokenProb(t, lp))
 
         candidates.sort(key=lambda x: x.logprob, reverse=True)
+        candidates = apply_sampling_filters(candidates, top_p, top_k)
 
         st.session_state.current_analysis = {
             "predicted_token": predicted_token,
             "candidates": candidates,
+            "top_p": top_p,
+            "top_k": top_k,
         }
 
     except Exception as e:
@@ -284,18 +327,65 @@ with st.sidebar:
     st.divider()
     st.subheader("Sampling Parameters")
 
-    temp = st.slider(
-        "Temperature", 0.0, 1.5, 1.0, 0.1, help="Higher = More Creative/Random"
-    )
-    top_p = st.slider("Top-P", 0.0, 1.0, 1.0, 0.05, help="Nucleus Sampling cutoff")
-    top_k = st.slider(
-        "Top-K",
-        0,
-        100,
-        0,
-        5,
-        help="Limit to top K tokens (Currently unsupported for Cerebras)",
-    )
+    t_col, t_reset = st.columns([4, 1])
+    with t_col:
+        temp = st.slider(
+            "Temperature",
+            0.0,
+            1.5,
+            st.session_state.temp_val,
+            0.1,
+            help="Higher = More Creative/Random",
+            key="temp_slider",
+        )
+    with t_reset:
+        st.write("")  # spacer
+        if st.button("↺", key="reset_temp", help="Reset to default (1.0)"):
+            st.session_state.temp_val = DEFAULT_TEMP
+            st.rerun()
+    st.session_state.temp_val = temp
+
+    p_col, p_reset = st.columns([4, 1])
+    with p_col:
+        top_p = st.slider(
+            "Top-P",
+            0.0,
+            1.0,
+            st.session_state.top_p_val,
+            0.05,
+            help="Nucleus Sampling cutoff — filters probability table and CSV",
+            key="top_p_slider",
+        )
+    with p_reset:
+        st.write("")
+        if st.button("↺", key="reset_top_p", help="Reset to default (1.0)"):
+            st.session_state.top_p_val = DEFAULT_TOP_P
+            st.session_state.current_analysis = None
+            st.rerun()
+    if top_p != st.session_state.top_p_val:
+        st.session_state.current_analysis = None
+    st.session_state.top_p_val = top_p
+
+    k_col, k_reset = st.columns([4, 1])
+    with k_col:
+        top_k = st.slider(
+            "Top-K",
+            0,
+            100,
+            st.session_state.top_k_val,
+            5,
+            help="Limit to top K tokens — filters probability table and CSV (0 = disabled)",
+            key="top_k_slider",
+        )
+    with k_reset:
+        st.write("")
+        if st.button("↺", key="reset_top_k", help="Reset to default (0)"):
+            st.session_state.top_k_val = DEFAULT_TOP_K
+            st.session_state.current_analysis = None
+            st.rerun()
+    if top_k != st.session_state.top_k_val:
+        st.session_state.current_analysis = None
+    st.session_state.top_k_val = top_k
 
     st.divider()
     st.subheader("Display & Mode")
@@ -402,6 +492,18 @@ else:
 
         df = pd.DataFrame(data)
 
+        # Build chart title showing active filters
+        active_filters = []
+        stored_top_p = analysis.get("top_p", 1.0)
+        stored_top_k = analysis.get("top_k", 0)
+        if stored_top_p < 1.0:
+            active_filters.append(f"top-p={stored_top_p}")
+        if stored_top_k and stored_top_k > 0:
+            active_filters.append(f"top-k={stored_top_k}")
+        filter_label = f" [{', '.join(active_filters)}]" if active_filters else ""
+        n_shown = min(10, len(df))
+        chart_title = f"Top {n_shown} Probabilities (Next Step){filter_label}"
+
         # 2-Column Layout
         col_viz, col_ctrl = st.columns([3, 2], gap="large")
 
@@ -412,7 +514,7 @@ else:
                 x="Probability (%)",
                 y="Token",
                 orientation="h",
-                title="Top 10 Probabilities (Next Step)",
+                title=chart_title,
                 text_auto=".1f",
                 color="Probability (%)",
                 color_continuous_scale="Blues",
@@ -440,7 +542,9 @@ else:
             st.markdown("---")
 
             # 2. Manual Select (Dropdown)
-            st.caption("Option A: Choose from Top-20")
+            st.caption(
+                f"Option A: Choose from {len(dropdown_options)} candidates{filter_label}"
+            )
             manual_choice = st.selectbox(
                 "Select token:", options=dropdown_options, label_visibility="collapsed"
             )
@@ -452,7 +556,10 @@ else:
             col_cust_input, col_cust_btn = st.columns([2, 1])
             with col_cust_input:
                 custom_token_input = st.text_input(
-                    "Custom", label_visibility="collapsed", placeholder="Type word..."
+                    "Custom",
+                    label_visibility="collapsed",
+                    placeholder="Type word...",
+                    key=f"custom_token_{st.session_state.custom_token_key}",
                 )
                 smart_space = st.checkbox(
                     "Prepend with space",
@@ -468,6 +575,7 @@ else:
                         if smart_space:
                             final_token = " " + final_token
 
+                        st.session_state.custom_token_key += 1  # clears the text box
                         commit_step(final_token)
 
             st.markdown("---")
