@@ -139,7 +139,8 @@ def analyze_next_step(api_key, model, temp, top_p, top_k):
             tokens = choice.logprobs.tokens
             top_logprobs_list = choice.logprobs.top_logprobs
 
-            # Build predicted_token by following the greedy path until a word boundary
+            # Build predicted_token by following the greedy path until a word boundary.
+            # tokens[0] may itself be a fragment (e.g. "Ag") or a full word (e.g. " Reaches").
             word_tokens = []
             for i, t in enumerate(tokens):
                 if i > 0 and not is_continuation(t):
@@ -147,10 +148,9 @@ def analyze_next_step(api_key, model, temp, top_p, top_k):
                 word_tokens.append(t)
             predicted_token = "".join(word_tokens)
 
-            # For each top candidate at position 0, complete it to a full word
-            # by appending continuation tokens from the greedy sequence.
-            # The greedy suffix (tokens[1:]) is the best available approximation
-            # of what follows each candidate first-token.
+            # Greedy suffix = the continuation sub-tokens after the first greedy token.
+            # If the first greedy token is already a complete word, suffix will be empty —
+            # fragment candidates then show as-is (prob still correct per first-sub-token rule).
             greedy_suffix = []
             for t in tokens[1:]:
                 if not is_continuation(t):
@@ -160,12 +160,10 @@ def analyze_next_step(api_key, model, temp, top_p, top_k):
             top_dict = top_logprobs_list[0]
             candidates = []
             for t, lp in top_dict.items():
-                if is_continuation(t):
-                    # Candidate is a continuation fragment — complete it with the greedy suffix
-                    completed = t + "".join(greedy_suffix)
+                if not is_continuation(t):
+                    completed = t  # full word already (has leading space/newline)
                 else:
-                    # Candidate starts a new word (has leading space/newline) — use as-is
-                    completed = t
+                    completed = t + "".join(greedy_suffix)  # fragment + greedy suffix
                 candidates.append(TokenProb(completed, lp))
         else:
             predicted_token = choice.text
@@ -346,7 +344,7 @@ def get_candidates_for_prompt(client, model, prompt, temp, top_p, top_k, word_mo
             word_tokens.append(t)
         predicted_token = "".join(word_tokens)
 
-        # Greedy suffix for completing candidates
+        # Greedy suffix for completing fragment candidates
         greedy_suffix = []
         for t in tokens[1:]:
             if not is_continuation(t):
@@ -356,7 +354,10 @@ def get_candidates_for_prompt(client, model, prompt, temp, top_p, top_k, word_mo
         top_dict = top_logprobs_list[0]
         candidates = []
         for t, lp in top_dict.items():
-            completed = (t + "".join(greedy_suffix)) if is_continuation(t) else t
+            if not is_continuation(t):
+                completed = t
+            else:
+                completed = t + "".join(greedy_suffix)
             candidates.append(TokenProb(completed, lp))
     else:
         predicted_token = choice.text
