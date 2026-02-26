@@ -56,6 +56,15 @@ def is_continuation(token):
     )
 
 
+class TokenProb:
+    def __init__(self, token, logprob):
+        self.token = token
+        self.logprob = logprob
+
+    def __repr__(self):
+        return f"TokenProb({self.token!r}, {self.logprob:.4f})"
+
+
 def apply_sampling_filters(candidates, top_p, top_k):
     """
     Apply top-p (nucleus) and top-k filters to a sorted list of TokenProb objects.
@@ -83,6 +92,68 @@ def apply_sampling_filters(candidates, top_p, top_k):
 
 def get_client(api_key):
     return OpenAI(base_url=CEREBRAS_BASE_URL, api_key=api_key)
+
+
+def _complete_fragment(client, model, base_prompt, fragment_token):
+    """Complete a single fragment token to a full word via one greedy API call.
+
+    Sends base_prompt + fragment_token, then scans the returned tokens for
+    the word boundary (first token that is NOT a continuation).  Returns the
+    fragment joined with all continuation tokens found (e.g. "Ag" -> "Agreement").
+    On error, returns fragment_token unchanged.
+    """
+    try:
+        response = client.completions.create(
+            model=model,
+            prompt=base_prompt + fragment_token,
+            max_tokens=5,
+            temperature=0,
+            logprobs=1,
+        )
+        choice = response.choices[0]
+        if choice.logprobs and choice.logprobs.tokens:
+            suffix_tokens = []
+            for t in choice.logprobs.tokens:
+                if not is_continuation(t):
+                    break
+                suffix_tokens.append(t)
+            return fragment_token + "".join(suffix_tokens)
+        return fragment_token
+    except Exception:
+        return fragment_token
+
+
+def build_word_candidates(tokens, top_logprobs_list, client, model, base_prompt):
+    """Build word-level predicted token and candidates list.
+
+    Replaces the duplicated word-mode logic formerly inlined in
+    analyze_next_step() and get_candidates_for_prompt().
+
+    Returns (predicted_token, candidates) where each candidate is a
+    TokenProb whose .token is the completed word and .logprob is the
+    first sub-token's logprob.
+    """
+    # 1. Build predicted_token by following greedy path until word boundary
+    word_tokens = []
+    for i, t in enumerate(tokens):
+        if i > 0 and not is_continuation(t):
+            break
+        word_tokens.append(t)
+    predicted_token = "".join(word_tokens)
+
+    # 2. Build candidates from first position's top logprobs
+    top_dict = top_logprobs_list[0]
+    candidates = []
+    for t, lp in top_dict.items():
+        if not is_continuation(t):
+            # Already a full word (has leading space/newline)
+            completed = t
+        else:
+            # Fragment — complete via its own greedy lookahead
+            completed = _complete_fragment(client, model, base_prompt, t)
+        candidates.append(TokenProb(completed, lp))
+
+    return predicted_token, candidates
 
 
 def build_llama_prompt():
@@ -129,48 +200,16 @@ def analyze_next_step(api_key, model, temp, top_p, top_k):
 
         choice = response.choices[0]
 
-        # Helper class shim
-        class TokenProb:
-            def __init__(self, token, logprob):
-                self.token = token
-                self.logprob = logprob
-
         if st.session_state.word_mode and choice.logprobs:
             tokens = choice.logprobs.tokens
             top_logprobs_list = choice.logprobs.top_logprobs
-
-            # Build predicted_token by following the greedy path until a word boundary.
-            # tokens[0] may itself be a fragment (e.g. "Ag") or a full word (e.g. " Reaches").
-            word_tokens = []
-            for i, t in enumerate(tokens):
-                if i > 0 and not is_continuation(t):
-                    break
-                word_tokens.append(t)
-            predicted_token = "".join(word_tokens)
-
-            # Greedy suffix = the continuation sub-tokens after the first greedy token.
-            # If the first greedy token is already a complete word, suffix will be empty —
-            # fragment candidates then show as-is (prob still correct per first-sub-token rule).
-            greedy_suffix = []
-            for t in tokens[1:]:
-                if not is_continuation(t):
-                    break
-                greedy_suffix.append(t)
-
-            top_dict = top_logprobs_list[0]
-            candidates = []
-            for t, lp in top_dict.items():
-                if not is_continuation(t):
-                    completed = t  # full word already (has leading space/newline)
-                else:
-                    completed = t + "".join(greedy_suffix)  # fragment + greedy suffix
-                candidates.append(TokenProb(completed, lp))
+            predicted_token, candidates = build_word_candidates(
+                tokens, top_logprobs_list, client, model, full_prompt
+            )
         else:
             predicted_token = choice.text
             top_dict = choice.logprobs.top_logprobs[0]
-            candidates = []
-            for t, lp in top_dict.items():
-                candidates.append(TokenProb(t, lp))
+            candidates = [TokenProb(t, lp) for t, lp in top_dict.items()]
 
         candidates.sort(key=lambda x: x.logprob, reverse=True)
         candidates = apply_sampling_filters(candidates, top_p, top_k)
@@ -209,12 +248,6 @@ def fast_forward(api_key, model, temp, top_p, top_k, num_tokens):
             c = response.choices[0]
             tokens = c.logprobs.tokens
             top_logprobs_list = c.logprobs.top_logprobs
-
-            # Helper class shim
-            class TokenProb:
-                def __init__(self, token, logprob):
-                    self.token = token
-                    self.logprob = logprob
 
             current_word_tokens = []
             current_word_cands = []
@@ -316,11 +349,6 @@ def get_candidates_for_prompt(client, model, prompt, temp, top_p, top_k, word_mo
     filtered by top-p/top-k. Also returns the greedy predicted token.
     """
 
-    class TokenProb:
-        def __init__(self, token, logprob):
-            self.token = token
-            self.logprob = logprob
-
     max_tokens = 10 if word_mode else 1
     response = client.completions.create(
         model=model,
@@ -335,30 +363,9 @@ def get_candidates_for_prompt(client, model, prompt, temp, top_p, top_k, word_mo
     if word_mode and choice.logprobs:
         tokens = choice.logprobs.tokens
         top_logprobs_list = choice.logprobs.top_logprobs
-
-        # Greedy predicted token (full word)
-        word_tokens = []
-        for i, t in enumerate(tokens):
-            if i > 0 and not is_continuation(t):
-                break
-            word_tokens.append(t)
-        predicted_token = "".join(word_tokens)
-
-        # Greedy suffix for completing fragment candidates
-        greedy_suffix = []
-        for t in tokens[1:]:
-            if not is_continuation(t):
-                break
-            greedy_suffix.append(t)
-
-        top_dict = top_logprobs_list[0]
-        candidates = []
-        for t, lp in top_dict.items():
-            if not is_continuation(t):
-                completed = t
-            else:
-                completed = t + "".join(greedy_suffix)
-            candidates.append(TokenProb(completed, lp))
+        predicted_token, candidates = build_word_candidates(
+            tokens, top_logprobs_list, client, model, prompt
+        )
     else:
         predicted_token = choice.text
         top_dict = choice.logprobs.top_logprobs[0]
@@ -566,6 +573,12 @@ with st.sidebar:
 
     tree_status = st.empty()
 
+    if st.session_state.word_mode:
+        st.caption(
+            "⚠️ Word mode is on — each tree node may trigger extra API calls "
+            "for fragment completion."
+        )
+
     if st.session_state.tree_csv is not None:
         st.download_button(
             "⬇️ Download Tree CSV",
@@ -721,6 +734,12 @@ else:
             )
             fig.update_layout(yaxis={"categoryorder": "total ascending"}, height=350)
             st.plotly_chart(fig, use_container_width=True)
+
+            if st.session_state.word_mode:
+                st.caption(
+                    "Word mode: fragment tokens completed via greedy lookahead. "
+                    "Probabilities reflect the first sub-token only."
+                )
 
             # 2. Data Table (Restored Feature)
             with st.expander("📊 View Raw Data Table", expanded=False):
