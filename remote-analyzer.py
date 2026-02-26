@@ -116,7 +116,7 @@ def analyze_next_step(api_key, model, temp, top_p, top_k):
 
     try:
         # If in word mode, we peek ahead multiple tokens to find the word boundary
-        max_tokens = 10 if st.session_state.word_mode else 1
+        max_tokens = 2 if st.session_state.word_mode else 1
 
         response = client.completions.create(
             model=model,
@@ -519,9 +519,9 @@ with st.sidebar:
         top_k = st.slider(
             "Top-K",
             0,
-            100,
+            20,
             st.session_state.top_k_val,
-            5,
+            1,
             help="Limit to top K tokens — filters probability table and CSV (0 = disabled)",
             key="top_k_slider",
         )
