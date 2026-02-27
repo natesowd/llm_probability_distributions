@@ -445,9 +445,7 @@ def explore_tree(
                     "Probability": round(prob, 6),
                     "LogProb": round(cand.logprob, 6),
                     "Cumulative_LogProb": round(node_cumulative_lp, 6),
-                    "Cumulative_Probability": round(
-                        math.exp(node_cumulative_lp), 6
-                    ),
+                    "Cumulative_Probability": round(math.exp(node_cumulative_lp), 6),
                     "Is_Greedy": (rank == 0),
                 }
             )
@@ -530,9 +528,9 @@ with st.sidebar:
         top_k = st.slider(
             "Top-K",
             0,
-            100,
+            20,
             st.session_state.top_k_val,
-            5,
+            1,
             help="Limit to top K tokens — filters probability table and CSV (0 = disabled)",
             key="top_k_slider",
         )
