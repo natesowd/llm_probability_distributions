@@ -8,12 +8,12 @@ import math
 st.set_page_config(layout="wide", page_title="Probability Explorer v2")
 
 # --- Constants & Defaults ---
-# DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct:cheapest"
-DEFAULT_MODEL = "llama3.1-8b"
-# API_BASE_URL = "https://router.huggingface.co/v1"
-API_BASE_URL = "https://api.cerebras.ai/v1"
-# API_KEY = "HF_API_KEY"
-API_KEY = "CEREBRAS_API_KEY"
+DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct:cheapest"
+# DEFAULT_MODEL = "llama3.1-8b"
+API_BASE_URL = "https://router.huggingface.co/v1"
+# API_BASE_URL = "https://api.cerebras.ai/v1"
+API_KEY = "HF_API_KEY"
+# API_KEY = "CEREBRAS_API_KEY"
 
 # --- Session State Initialization ---
 if "history" not in st.session_state:
@@ -89,23 +89,23 @@ def apply_sampling_filters(candidates, top_p, top_k):
     return candidates
 
 
-def build_messages():
-    """Constructs the messages list for chat completion."""
-    messages = [
-        {"role": "system", "content": st.session_state.system_prompt},
-        {"role": "user", "content": st.session_state.user_prompt},
-    ]
+def build_llama_prompt():
+    """Constructs the raw Llama 3 prompt for text completion."""
+    sys = st.session_state.system_prompt
+    user = st.session_state.user_prompt
+
+    assistant_content = ""
     if st.session_state.history:
         assistant_content = "".join(
             [item["token"] for item in st.session_state.history]
         )
-        messages.append({"role": "assistant", "content": assistant_content})
-    return messages
+
+    prompt = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{sys}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n{assistant_content}"
+    return prompt
 
 
 def build_full_prompt_debug():
-    messages = build_messages()
-    return "\n".join([f"[{m['role']}]: {m['content']}" for m in messages])
+    return build_llama_prompt()
 
 
 def analyze_next_step(api_key, model, temp, top_p, top_k):
@@ -114,18 +114,17 @@ def analyze_next_step(api_key, model, temp, top_p, top_k):
     If word_mode is enabled, it looks ahead to complete the word.
     """
     client = get_client(api_key)
-    messages = build_messages()
+    full_prompt = build_llama_prompt()
 
     try:
         # If in word mode, we peek ahead multiple tokens to find the word boundary
         max_tokens = 10 if st.session_state.word_mode else 1
 
-        response = client.chat.completions.create(
+        response = client.completions.create(
             model=model,
-            messages=messages,
+            prompt=full_prompt,
             max_tokens=max_tokens,
-            logprobs=True,
-            top_logprobs=20,
+            logprobs=20,
             temperature=temp,
             top_p=top_p,
         )
@@ -138,13 +137,9 @@ def analyze_next_step(api_key, model, temp, top_p, top_k):
                 self.token = token
                 self.logprob = logprob
 
-        if st.session_state.word_mode and choice.logprobs and choice.logprobs.content:
-            content_logprobs = choice.logprobs.content
-            tokens = [cl.token for cl in content_logprobs]
-            top_logprobs_list = [
-                {tl.token: tl.logprob for tl in cl.top_logprobs}
-                for cl in content_logprobs
-            ]
+        if st.session_state.word_mode and choice.logprobs:
+            tokens = choice.logprobs.tokens
+            top_logprobs_list = choice.logprobs.top_logprobs
 
             # Build predicted_token by following the greedy path until a word boundary
             word_tokens = []
@@ -175,14 +170,8 @@ def analyze_next_step(api_key, model, temp, top_p, top_k):
                     completed = t
                 candidates.append(TokenProb(completed, lp))
         else:
-            predicted_token = choice.message.content
-            if choice.logprobs and choice.logprobs.content:
-                top_dict = {
-                    tl.token: tl.logprob
-                    for tl in choice.logprobs.content[0].top_logprobs
-                }
-            else:
-                top_dict = {}
+            predicted_token = choice.text
+            top_dict = choice.logprobs.top_logprobs[0]
             candidates = []
             for t, lp in top_dict.items():
                 candidates.append(TokenProb(t, lp))
@@ -202,7 +191,7 @@ def analyze_next_step(api_key, model, temp, top_p, top_k):
 
 
 def fast_forward(api_key, model, temp, top_p, top_k, num_tokens):
-    messages = build_messages()
+    full_prompt = build_llama_prompt()
     client = get_client(api_key)
 
     # In word mode, we might need more actual tokens to satisfy the 'num_tokens' as words
@@ -210,20 +199,19 @@ def fast_forward(api_key, model, temp, top_p, top_k, num_tokens):
     actual_max_tokens = num_tokens if not st.session_state.word_mode else num_tokens * 3
 
     try:
-        response = client.chat.completions.create(
+        response = client.completions.create(
             model=model,
-            messages=messages,
+            prompt=full_prompt,
             max_tokens=actual_max_tokens,
-            logprobs=True,
-            top_logprobs=5,
+            logprobs=5,
             temperature=temp,
             top_p=top_p,
         )
 
-        c = response.choices[0]
-        if c.logprobs and c.logprobs.content:
-            content_logprobs = c.logprobs.content
-            tokens = [cl.token for cl in content_logprobs]
+        if response.choices[0].logprobs:
+            c = response.choices[0]
+            tokens = c.logprobs.tokens
+            top_logprobs_list = c.logprobs.top_logprobs
 
             # Helper class shim
             class TokenProb:
@@ -235,12 +223,10 @@ def fast_forward(api_key, model, temp, top_p, top_k, num_tokens):
             current_word_cands = []
 
             for i, token_str in enumerate(tokens):
-                # Convert chat.completions logprobs to TokenProb list
                 current_cands = []
-                cl = content_logprobs[i]
-                if cl.top_logprobs:
-                    for tl in cl.top_logprobs:
-                        current_cands.append(TokenProb(tl.token, tl.logprob))
+                if top_logprobs_list and i < len(top_logprobs_list):
+                    for t, lp in top_logprobs_list[i].items():
+                        current_cands.append(TokenProb(t, lp))
                     current_cands.sort(key=lambda x: x.logprob, reverse=True)
 
                 if st.session_state.word_mode:
@@ -325,20 +311,19 @@ def convert_history_to_csv():
     return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
 
 
-def build_messages_from_text(sys_prompt, user_prompt, assistant_so_far):
-    """Build a messages list from explicit text (not session state)."""
-    messages = [
-        {"role": "system", "content": sys_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-    if assistant_so_far:
-        messages.append({"role": "assistant", "content": assistant_so_far})
-    return messages
+def build_llama_prompt_from_text(sys_prompt, user_prompt, assistant_so_far):
+    """Build a raw Llama 3 prompt from explicit text (not session state)."""
+    return (
+        f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+        f"{sys_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+        f"{user_prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        f"{assistant_so_far}"
+    )
 
 
-def get_candidates_for_prompt(client, model, messages, temp, top_p, top_k):
+def get_candidates_for_prompt(client, model, prompt, temp, top_p, top_k):
     """
-    Call the API for a given messages list and return a sorted, filtered
+    Call the API for a given raw prompt string and return a sorted, filtered
     list of TokenProb candidates (single-token, no word-mode logic).
     """
 
@@ -347,26 +332,23 @@ def get_candidates_for_prompt(client, model, messages, temp, top_p, top_k):
             self.token = token
             self.logprob = logprob
 
-    response = client.chat.completions.create(
+    response = client.completions.create(
         model=model,
-        messages=messages,
+        prompt=prompt,
         max_tokens=1,
-        logprobs=True,
-        top_logprobs=20,
+        logprobs=20,
         temperature=temp,
         top_p=top_p,
     )
     choice = response.choices[0]
-    candidates = [
-        TokenProb(tl.token, tl.logprob)
-        for tl in choice.logprobs.content[0].top_logprobs
-    ]
+    top_dict = choice.logprobs.top_logprobs[0]
+    candidates = [TokenProb(t, lp) for t, lp in top_dict.items()]
     candidates.sort(key=lambda x: x.logprob, reverse=True)
     candidates = apply_sampling_filters(candidates, top_p, top_k)
     return candidates
 
 
-def complete_word_greedily(client, model, base_messages, initial_token, temp, top_p):
+def complete_word_greedily(client, model, base_prompt, initial_token, temp, top_p):
     """
     Given an initial token that is a word fragment (no leading space/newline),
     greedily extend it by repeatedly taking the top-1 continuation token
@@ -376,35 +358,24 @@ def complete_word_greedily(client, model, base_messages, initial_token, temp, to
     The caller keeps the original token's probability unchanged.
     """
     word = initial_token
-
-    # Determine current assistant content and non-assistant messages
-    if base_messages and base_messages[-1]["role"] == "assistant":
-        non_assistant_msgs = base_messages[:-1]
-        assistant_text = base_messages[-1]["content"] + initial_token
-    else:
-        non_assistant_msgs = list(base_messages)
-        assistant_text = initial_token
+    current_prompt = base_prompt + initial_token
 
     # Safety limit to avoid infinite loops on pathological continuations
     for _ in range(20):
-        messages = non_assistant_msgs + [
-            {"role": "assistant", "content": assistant_text}
-        ]
-        response = client.chat.completions.create(
+        response = client.completions.create(
             model=model,
-            messages=messages,
+            prompt=current_prompt,
             max_tokens=1,
-            logprobs=True,
-            top_logprobs=1,
+            logprobs=1,
             temperature=temp,
             top_p=top_p,
         )
         choice = response.choices[0]
-        next_token = choice.message.content
+        next_token = choice.text
         if not next_token or not is_continuation(next_token):
             break
         word += next_token
-        assistant_text += next_token
+        current_prompt += next_token
 
     return word
 
@@ -432,7 +403,7 @@ def explore_tree(
         if depth_remaining == 0:
             return
 
-        messages = build_messages_from_text(sys_prompt, user_prompt, current_text)
+        prompt = build_llama_prompt_from_text(sys_prompt, user_prompt, current_text)
 
         try:
             total_calls[0] += 1
@@ -441,7 +412,7 @@ def explore_tree(
                 f"Current path: {path or 'root'}"
             )
             candidates = get_candidates_for_prompt(
-                client, model, messages, temp, top_p, top_k
+                client, model, prompt, temp, top_p, top_k
             )
         except Exception as e:
             status_placeholder.error(f"API error at path {path}: {e}")
@@ -458,7 +429,7 @@ def explore_tree(
                 try:
                     total_calls[0] += 1
                     display_token = complete_word_greedily(
-                        client, model, messages, cand.token, temp, top_p
+                        client, model, prompt, cand.token, temp, top_p
                     )
                 except Exception:
                     display_token = cand.token  # fallback to raw token
