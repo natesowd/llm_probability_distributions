@@ -125,7 +125,7 @@ def analyze_next_step(api_key, model, temp, top_p, top_k):
         response = client.chat.completions.create(
             model=model,
             prompt=full_prompt,
-            max_tokens=max_tokens,
+            max_new_tokens=max_tokens,
             logprobs=20,
             temperature=temp,
             top_p=top_p,
@@ -204,7 +204,7 @@ def fast_forward(api_key, model, temp, top_p, top_k, num_tokens):
         response = client.chat.completions.create(
             model=model,
             prompt=full_prompt,
-            max_tokens=actual_max_tokens,
+            max__new_tokens=actual_max_tokens,
             logprobs=5,  # Minimal logprobs for history
             temperature=temp,
             top_p=top_p,
@@ -340,7 +340,7 @@ def get_candidates_for_prompt(client, model, prompt, temp, top_p, top_k):
     response = client.chat.completions.create(
         model=model,
         prompt=prompt,
-        max_tokens=1,
+        max_new_tokens=1,
         logprobs=20,
         temperature=temp,
         top_p=top_p,
@@ -370,7 +370,7 @@ def complete_word_greedily(client, model, base_prompt, initial_token, temp, top_
         response = client.chat.completions.create(
             model=model,
             prompt=current_prompt,
-            max_tokens=1,
+            max_new_tokens=1,
             logprobs=1,
             temperature=temp,
             top_p=top_p,
