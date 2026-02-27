@@ -8,7 +8,7 @@ import math
 st.set_page_config(layout="wide", page_title="Probability Explorer v2")
 
 # --- Constants & Defaults ---
-DEFAULT_MODEL = "llama3.1-8b"
+DEFAULT_MODEL = "llama3.1-8b:cheapest"
 API_BASE_URL = "https://router.huggingface.co/v1"
 API_KEY = "HF_API_KEY"
 
