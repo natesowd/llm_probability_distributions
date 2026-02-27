@@ -32,6 +32,10 @@ if "top_p_val" not in st.session_state:
     st.session_state.top_p_val = 1.0
 if "top_k_val" not in st.session_state:
     st.session_state.top_k_val = 0
+if "tree_csv" not in st.session_state:
+    st.session_state.tree_csv = None
+if "tree_running" not in st.session_state:
+    st.session_state.tree_running = False
 
 # --- Defaults ---
 DEFAULT_TEMP = 1.0
@@ -79,8 +83,6 @@ def apply_sampling_filters(candidates, top_p, top_k):
         candidates = filtered
 
     return candidates
-
-    return OpenAI(base_url=CEREBRAS_BASE_URL, api_key=api_key)
 
 
 def build_llama_prompt():
@@ -310,6 +312,163 @@ def convert_history_to_csv():
     return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
 
 
+def build_llama_prompt_from_text(sys_prompt, user_prompt, assistant_so_far):
+    """Build a raw Llama 3 prompt from explicit text (not session state)."""
+    return (
+        f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+        f"{sys_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+        f"{user_prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        f"{assistant_so_far}"
+    )
+
+
+def get_candidates_for_prompt(client, model, prompt, temp, top_p, top_k):
+    """
+    Call the API for a given raw prompt string and return a sorted, filtered
+    list of TokenProb candidates (single-token, no word-mode logic).
+    """
+
+    class TokenProb:
+        def __init__(self, token, logprob):
+            self.token = token
+            self.logprob = logprob
+
+    response = client.completions.create(
+        model=model,
+        prompt=prompt,
+        max_tokens=1,
+        logprobs=20,
+        temperature=temp,
+        top_p=top_p,
+    )
+    choice = response.choices[0]
+    top_dict = choice.logprobs.top_logprobs[0]
+    candidates = [TokenProb(t, lp) for t, lp in top_dict.items()]
+    candidates.sort(key=lambda x: x.logprob, reverse=True)
+    candidates = apply_sampling_filters(candidates, top_p, top_k)
+    return candidates
+
+
+def complete_word_greedily(client, model, base_prompt, initial_token, temp, top_p):
+    """
+    Given an initial token that is a word fragment (no leading space/newline),
+    greedily extend it by repeatedly taking the top-1 continuation token
+    until a word boundary is reached.
+
+    Returns the completed word string (initial_token + greedy continuations).
+    The caller keeps the original token's probability unchanged.
+    """
+    word = initial_token
+    current_prompt = base_prompt + initial_token
+
+    # Safety limit to avoid infinite loops on pathological continuations
+    for _ in range(20):
+        response = client.completions.create(
+            model=model,
+            prompt=current_prompt,
+            max_tokens=1,
+            logprobs=1,
+            temperature=temp,
+            top_p=top_p,
+        )
+        choice = response.choices[0]
+        next_token = choice.text
+        if not next_token or not is_continuation(next_token):
+            break
+        word += next_token
+        current_prompt += next_token
+
+    return word
+
+
+def explore_tree(
+    api_key, model, temp, top_p, top_k, depth, word_mode, status_placeholder
+):
+    """
+    Recursively explore the probability tree up to `depth` levels deep.
+    Returns a flat list of row dicts for CSV export.
+
+    When word_mode is enabled, continuation tokens (no leading space) are
+    greedily completed to full words. The CSV records the completed word
+    but keeps the probability of the original first sub-token.
+    """
+    client = get_client(api_key)
+    sys_prompt = st.session_state.system_prompt
+    user_prompt = st.session_state.user_prompt
+    history_text = "".join([item["token"] for item in st.session_state.history])
+
+    rows = []
+    total_calls = [0]
+
+    def recurse(current_text, depth_remaining, path, cumulative_logprob):
+        if depth_remaining == 0:
+            return
+
+        prompt = build_llama_prompt_from_text(sys_prompt, user_prompt, current_text)
+
+        try:
+            total_calls[0] += 1
+            status_placeholder.info(
+                f"🌳 Exploring tree... {total_calls[0]} API call(s) made. "
+                f"Current path: {path or 'root'}"
+            )
+            candidates = get_candidates_for_prompt(
+                client, model, prompt, temp, top_p, top_k
+            )
+        except Exception as e:
+            status_placeholder.error(f"API error at path {path}: {e}")
+            return
+
+        for rank, cand in enumerate(candidates):
+            node_id = f"{path}.{rank + 1}" if path else str(rank + 1)
+            prob = math.exp(cand.logprob)
+            node_cumulative_lp = cumulative_logprob + cand.logprob
+
+            # Word mode: greedily complete partial-word tokens
+            display_token = cand.token
+            if word_mode and is_continuation(cand.token):
+                try:
+                    total_calls[0] += 1
+                    display_token = complete_word_greedily(
+                        client, model, prompt, cand.token, temp, top_p
+                    )
+                except Exception:
+                    display_token = cand.token  # fallback to raw token
+
+            rows.append(
+                {
+                    "Depth": len(node_id.split(".")),
+                    "Node_ID": node_id,
+                    "Context_So_Far": current_text,
+                    "Candidate_Token": display_token,
+                    "Rank": rank + 1,
+                    "Probability": round(prob, 6),
+                    "LogProb": round(cand.logprob, 6),
+                    "Cumulative_LogProb": round(node_cumulative_lp, 6),
+                    "Cumulative_Probability": round(
+                        math.exp(node_cumulative_lp), 6
+                    ),
+                    "Is_Greedy": (rank == 0),
+                }
+            )
+
+            # Recurse: append the (possibly completed) token and go deeper
+            recurse(
+                current_text + display_token,
+                depth_remaining - 1,
+                node_id,
+                node_cumulative_lp,
+            )
+
+    recurse(history_text, depth, "", 0.0)
+    return rows
+
+
+def tree_rows_to_csv(rows):
+    """Convert tree exploration rows to CSV bytes."""
+    return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
+
+
 # --- Sidebar UI ---
 with st.sidebar:
     st.header("⚙️ Configuration")
@@ -406,10 +565,63 @@ with st.sidebar:
         st.button("⬇️ Download Data (CSV)", disabled=True)
 
     st.divider()
+    st.subheader("🌳 Tree Explorer")
+    tree_depth = st.slider(
+        "Tree Depth",
+        min_value=1,
+        max_value=10,
+        value=3,
+        step=1,
+        help="How many generations deep to explore. Warning: grows exponentially with candidates × depth.",
+    )
+
+    tree_status = st.empty()
+
+    if st.session_state.tree_csv is not None:
+        st.download_button(
+            "⬇️ Download Tree CSV",
+            st.session_state.tree_csv,
+            "probability_tree.csv",
+            "text/csv",
+            key="tree_dl",
+        )
+        if st.button("🗑️ Clear Tree", key="clear_tree"):
+            st.session_state.tree_csv = None
+            st.rerun()
+    else:
+        if st.button(
+            "🌳 Explore Tree",
+            key="run_tree",
+            disabled=not st.session_state.context_locked,
+        ):
+            with st.spinner("Building probability tree..."):
+                rows = explore_tree(
+                    api_key,
+                    model_name,
+                    temp,
+                    top_p,
+                    top_k,
+                    tree_depth,
+                    st.session_state.word_mode,
+                    tree_status,
+                )
+            if rows:
+                st.session_state.tree_csv = tree_rows_to_csv(rows)
+                tree_status.success(
+                    f"✅ Tree complete! {len(rows)} rows across {tree_depth} depth(s)."
+                )
+                st.rerun()
+            else:
+                tree_status.warning(
+                    "No rows generated. Check your filters or API connection."
+                )
+
+    st.divider()
     if st.button("🔄 Reset / Start Over"):
         st.session_state.history = []
         st.session_state.current_analysis = None
         st.session_state.context_locked = False
+        st.session_state.tree_csv = None
         st.rerun()
 
     st.divider()
