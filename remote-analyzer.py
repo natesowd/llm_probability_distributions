@@ -8,7 +8,7 @@ import math
 st.set_page_config(layout="wide", page_title="Probability Explorer v2")
 
 # --- Constants & Defaults ---
-DEFAULT_MODEL = "llama3.1-8b:cheapest"
+DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct:cheapest"
 API_BASE_URL = "https://router.huggingface.co/v1"
 API_KEY = "HF_API_KEY"
 
@@ -22,7 +22,7 @@ if "context_locked" not in st.session_state:
 if "system_prompt" not in st.session_state:
     st.session_state.system_prompt = "You are a helpful assistant."
 if "user_prompt" not in st.session_state:
-    st.session_state.user_prompt = "Write a headline for a long form journalistic article about AI ethics agreement reached across the EU."
+    st.session_state.user_prompt = "Write a 6- to 7-word headline for a long form journalistic article about AI ethics agreement reached across the EU."
 if "word_mode" not in st.session_state:
     st.session_state.word_mode = True
 if "custom_token_key" not in st.session_state:
