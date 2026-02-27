@@ -122,7 +122,7 @@ def analyze_next_step(api_key, model, temp, top_p, top_k):
         # If in word mode, we peek ahead multiple tokens to find the word boundary
         max_tokens = 10 if st.session_state.word_mode else 1
 
-        response = client.completions.create(
+        response = client.chat.completions.create(
             model=model,
             prompt=full_prompt,
             max_tokens=max_tokens,
@@ -201,7 +201,7 @@ def fast_forward(api_key, model, temp, top_p, top_k, num_tokens):
     actual_max_tokens = num_tokens if not st.session_state.word_mode else num_tokens * 3
 
     try:
-        response = client.completions.create(
+        response = client.chat.completions.create(
             model=model,
             prompt=full_prompt,
             max_tokens=actual_max_tokens,
@@ -337,7 +337,7 @@ def get_candidates_for_prompt(client, model, prompt, temp, top_p, top_k):
             self.token = token
             self.logprob = logprob
 
-    response = client.completions.create(
+    response = client.chat.completions.create(
         model=model,
         prompt=prompt,
         max_tokens=1,
@@ -367,7 +367,7 @@ def complete_word_greedily(client, model, base_prompt, initial_token, temp, top_
 
     # Safety limit to avoid infinite loops on pathological continuations
     for _ in range(20):
-        response = client.completions.create(
+        response = client.chat.completions.create(
             model=model,
             prompt=current_prompt,
             max_tokens=1,
