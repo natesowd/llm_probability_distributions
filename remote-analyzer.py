@@ -26,6 +26,10 @@ if "word_mode" not in st.session_state:
     st.session_state.word_mode = True
 if "custom_token_key" not in st.session_state:
     st.session_state.custom_token_key = 0
+if "tree_csv" not in st.session_state:
+    st.session_state.tree_csv = None
+if "tree_running" not in st.session_state:
+    st.session_state.tree_running = False
 if "temp_val" not in st.session_state:
     st.session_state.temp_val = 1.0
 if "top_p_val" not in st.session_state:
@@ -52,8 +56,13 @@ def is_continuation(token):
     )
 
 
-def get_client(api_key):
-    return OpenAI(base_url=CEREBRAS_BASE_URL, api_key=api_key)
+class TokenProb:
+    def __init__(self, token, logprob):
+        self.token = token
+        self.logprob = logprob
+
+    def __repr__(self):
+        return f"TokenProb({self.token!r}, {self.logprob:.4f})"
 
 
 def apply_sampling_filters(candidates, top_p, top_k):
@@ -80,7 +89,71 @@ def apply_sampling_filters(candidates, top_p, top_k):
 
     return candidates
 
+
+def get_client(api_key):
     return OpenAI(base_url=CEREBRAS_BASE_URL, api_key=api_key)
+
+
+def _complete_fragment(client, model, base_prompt, fragment_token):
+    """Complete a single fragment token to a full word via one greedy API call.
+
+    Sends base_prompt + fragment_token, then scans the returned tokens for
+    the word boundary (first token that is NOT a continuation).  Returns the
+    fragment joined with all continuation tokens found (e.g. "Ag" -> "Agreement").
+    On error, returns fragment_token unchanged.
+    """
+    try:
+        response = client.completions.create(
+            model=model,
+            prompt=base_prompt + fragment_token,
+            max_tokens=5,
+            temperature=0,
+            logprobs=1,
+        )
+        choice = response.choices[0]
+        if choice.logprobs and choice.logprobs.tokens:
+            suffix_tokens = []
+            for t in choice.logprobs.tokens:
+                if not is_continuation(t):
+                    break
+                suffix_tokens.append(t)
+            return fragment_token + "".join(suffix_tokens)
+        return fragment_token
+    except Exception:
+        return fragment_token
+
+
+def build_word_candidates(tokens, top_logprobs_list, client, model, base_prompt):
+    """Build word-level predicted token and candidates list.
+
+    Replaces the duplicated word-mode logic formerly inlined in
+    analyze_next_step() and get_candidates_for_prompt().
+
+    Returns (predicted_token, candidates) where each candidate is a
+    TokenProb whose .token is the completed word and .logprob is the
+    first sub-token's logprob.
+    """
+    # 1. Build predicted_token by following greedy path until word boundary
+    word_tokens = []
+    for i, t in enumerate(tokens):
+        if i > 0 and not is_continuation(t):
+            break
+        word_tokens.append(t)
+    predicted_token = "".join(word_tokens)
+
+    # 2. Build candidates from first position's top logprobs
+    top_dict = top_logprobs_list[0]
+    candidates = []
+    for t, lp in top_dict.items():
+        if not is_continuation(t):
+            # Already a full word (has leading space/newline)
+            completed = t
+        else:
+            # Fragment — complete via its own greedy lookahead
+            completed = _complete_fragment(client, model, base_prompt, t)
+        candidates.append(TokenProb(completed, lp))
+
+    return predicted_token, candidates
 
 
 def build_llama_prompt():
@@ -114,7 +187,7 @@ def analyze_next_step(api_key, model, temp, top_p, top_k):
 
     try:
         # If in word mode, we peek ahead multiple tokens to find the word boundary
-        max_tokens = 10 if st.session_state.word_mode else 1
+        max_tokens = 2 if st.session_state.word_mode else 1
 
         response = client.completions.create(
             model=model,
@@ -127,50 +200,16 @@ def analyze_next_step(api_key, model, temp, top_p, top_k):
 
         choice = response.choices[0]
 
-        # Helper class shim
-        class TokenProb:
-            def __init__(self, token, logprob):
-                self.token = token
-                self.logprob = logprob
-
         if st.session_state.word_mode and choice.logprobs:
             tokens = choice.logprobs.tokens
             top_logprobs_list = choice.logprobs.top_logprobs
-
-            # Build predicted_token by following the greedy path until a word boundary
-            word_tokens = []
-            for i, t in enumerate(tokens):
-                if i > 0 and not is_continuation(t):
-                    break
-                word_tokens.append(t)
-            predicted_token = "".join(word_tokens)
-
-            # For each top candidate at position 0, complete it to a full word
-            # by appending continuation tokens from the greedy sequence.
-            # The greedy suffix (tokens[1:]) is the best available approximation
-            # of what follows each candidate first-token.
-            greedy_suffix = []
-            for t in tokens[1:]:
-                if not is_continuation(t):
-                    break
-                greedy_suffix.append(t)
-
-            top_dict = top_logprobs_list[0]
-            candidates = []
-            for t, lp in top_dict.items():
-                if is_continuation(t):
-                    # Candidate is a continuation fragment — complete it with the greedy suffix
-                    completed = t + "".join(greedy_suffix)
-                else:
-                    # Candidate starts a new word (has leading space/newline) — use as-is
-                    completed = t
-                candidates.append(TokenProb(completed, lp))
+            predicted_token, candidates = build_word_candidates(
+                tokens, top_logprobs_list, client, model, full_prompt
+            )
         else:
             predicted_token = choice.text
             top_dict = choice.logprobs.top_logprobs[0]
-            candidates = []
-            for t, lp in top_dict.items():
-                candidates.append(TokenProb(t, lp))
+            candidates = [TokenProb(t, lp) for t, lp in top_dict.items()]
 
         candidates.sort(key=lambda x: x.logprob, reverse=True)
         candidates = apply_sampling_filters(candidates, top_p, top_k)
@@ -209,12 +248,6 @@ def fast_forward(api_key, model, temp, top_p, top_k, num_tokens):
             c = response.choices[0]
             tokens = c.logprobs.tokens
             top_logprobs_list = c.logprobs.top_logprobs
-
-            # Helper class shim
-            class TokenProb:
-                def __init__(self, token, logprob):
-                    self.token = token
-                    self.logprob = logprob
 
             current_word_tokens = []
             current_word_cands = []
@@ -310,7 +343,129 @@ def convert_history_to_csv():
     return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
 
 
-# --- Sidebar UI ---
+def get_candidates_for_prompt(client, model, prompt, temp, top_p, top_k, word_mode):
+    """
+    Call the API for a given raw prompt string and return a list of (token, logprob) tuples,
+    filtered by top-p/top-k. Also returns the greedy predicted token.
+    """
+
+    max_tokens = 10 if word_mode else 1
+    response = client.completions.create(
+        model=model,
+        prompt=prompt,
+        max_tokens=max_tokens,
+        logprobs=20,
+        temperature=temp,
+        top_p=top_p,
+    )
+    choice = response.choices[0]
+
+    if word_mode and choice.logprobs:
+        tokens = choice.logprobs.tokens
+        top_logprobs_list = choice.logprobs.top_logprobs
+        predicted_token, candidates = build_word_candidates(
+            tokens, top_logprobs_list, client, model, prompt
+        )
+    else:
+        predicted_token = choice.text
+        top_dict = choice.logprobs.top_logprobs[0]
+        candidates = [TokenProb(t, lp) for t, lp in top_dict.items()]
+
+    candidates.sort(key=lambda x: x.logprob, reverse=True)
+    candidates = apply_sampling_filters(candidates, top_p, top_k)
+    return predicted_token, candidates
+
+
+def build_llama_prompt_from_text(sys_prompt, user_prompt, assistant_so_far):
+    """Build a raw Llama 3 prompt from explicit text (not session state)."""
+    return (
+        f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+        f"{sys_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+        f"{user_prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        f"{assistant_so_far}"
+    )
+
+
+def explore_tree(
+    api_key, model, temp, top_p, top_k, depth, word_mode, status_placeholder
+):
+    """
+    Recursively explore the probability tree up to `depth` levels deep.
+    Returns a flat list of row dicts for CSV export.
+
+    Each row represents one candidate at one node, with columns:
+      - Depth: how deep in the tree (1 = first generation)
+      - Node_ID: dot-separated path, e.g. "1.2.3"
+      - Context_So_Far: the text generated by the current branch to reach this node
+      - Candidate_Token: this candidate token
+      - Rank: rank among siblings
+      - Probability: probability of this candidate
+      - LogProb: log probability
+      - Cumulative_LogProb: sum of logprobs along the path to this node
+      - Is_Greedy: whether this candidate was the greedy (top-1) pick
+    """
+    client = get_client(api_key)
+    sys_prompt = st.session_state.system_prompt
+    user_prompt = st.session_state.user_prompt
+    history_text = "".join([item["token"] for item in st.session_state.history])
+
+    rows = []
+    total_calls = [0]
+
+    def recurse(current_text, depth_remaining, path, cumulative_logprob):
+        if depth_remaining == 0:
+            return
+
+        prompt = build_llama_prompt_from_text(sys_prompt, user_prompt, current_text)
+
+        try:
+            total_calls[0] += 1
+            status_placeholder.info(
+                f"🌳 Exploring tree... {total_calls[0]} API call(s) made. Current path: {path or 'root'}"
+            )
+            predicted_token, candidates = get_candidates_for_prompt(
+                client, model, prompt, temp, top_p, top_k, word_mode
+            )
+        except Exception as e:
+            status_placeholder.error(f"API error at path {path}: {e}")
+            return
+
+        for rank, cand in enumerate(candidates):
+            node_id = f"{path}.{rank + 1}" if path else str(rank + 1)
+            prob = math.exp(cand.logprob)
+            node_cumulative_lp = cumulative_logprob + cand.logprob
+
+            rows.append(
+                {
+                    "Depth": len(node_id.split(".")),
+                    "Node_ID": node_id,
+                    "Context_So_Far": current_text,
+                    "Candidate_Token": cand.token,
+                    "Rank": rank + 1,
+                    "Probability": round(prob, 6),
+                    "LogProb": round(cand.logprob, 6),
+                    "Cumulative_LogProb": round(node_cumulative_lp, 6),
+                    "Cumulative_Probability": round(math.exp(node_cumulative_lp), 6),
+                    "Is_Greedy": (rank == 0),
+                }
+            )
+
+            # Recurse: append the candidate token to context and go deeper
+            recurse(
+                current_text + cand.token,
+                depth_remaining - 1,
+                node_id,
+                node_cumulative_lp,
+            )
+
+    recurse(history_text, depth, "", 0.0)
+    return rows
+
+
+def tree_rows_to_csv(rows):
+    return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
+
+
 with st.sidebar:
     st.header("⚙️ Configuration")
 
@@ -371,9 +526,9 @@ with st.sidebar:
         top_k = st.slider(
             "Top-K",
             0,
-            100,
+            20,
             st.session_state.top_k_val,
-            5,
+            1,
             help="Limit to top K tokens — filters probability table and CSV (0 = disabled)",
             key="top_k_slider",
         )
@@ -404,6 +559,64 @@ with st.sidebar:
         )
     else:
         st.button("⬇️ Download Data (CSV)", disabled=True)
+
+    st.divider()
+    st.subheader("🌳 Tree Explorer")
+    tree_depth = st.slider(
+        "Tree Depth",
+        min_value=1,
+        max_value=10,
+        value=3,
+        step=1,
+        help="How many generations deep to explore. Warning: grows exponentially with candidates × depth.",
+    )
+
+    tree_status = st.empty()
+
+    if st.session_state.word_mode:
+        st.caption(
+            "⚠️ Word mode is on — each tree node may trigger extra API calls "
+            "for fragment completion."
+        )
+
+    if st.session_state.tree_csv is not None:
+        st.download_button(
+            "⬇️ Download Tree CSV",
+            st.session_state.tree_csv,
+            "probability_tree.csv",
+            "text/csv",
+            key="tree_dl",
+        )
+        if st.button("🗑️ Clear Tree", key="clear_tree"):
+            st.session_state.tree_csv = None
+            st.rerun()
+    else:
+        if st.button(
+            "🌳 Explore Tree",
+            key="run_tree",
+            disabled=not st.session_state.context_locked,
+        ):
+            with st.spinner("Building probability tree..."):
+                rows = explore_tree(
+                    api_key,
+                    model_name,
+                    temp,
+                    top_p,
+                    top_k,
+                    tree_depth,
+                    st.session_state.word_mode,
+                    tree_status,
+                )
+            if rows:
+                st.session_state.tree_csv = tree_rows_to_csv(rows)
+                tree_status.success(
+                    f"✅ Tree complete! {len(rows)} rows across {tree_depth} depth(s)."
+                )
+                st.rerun()
+            else:
+                tree_status.warning(
+                    "No rows generated. Check your filters or API connection."
+                )
 
     st.divider()
     if st.button("🔄 Reset / Start Over"):
@@ -521,6 +734,12 @@ else:
             )
             fig.update_layout(yaxis={"categoryorder": "total ascending"}, height=350)
             st.plotly_chart(fig, use_container_width=True)
+
+            if st.session_state.word_mode:
+                st.caption(
+                    "Word mode: fragment tokens completed via greedy lookahead. "
+                    "Probabilities reflect the first sub-token only."
+                )
 
             # 2. Data Table (Restored Feature)
             with st.expander("📊 View Raw Data Table", expanded=False):
