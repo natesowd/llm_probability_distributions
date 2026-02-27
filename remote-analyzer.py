@@ -9,7 +9,8 @@ st.set_page_config(layout="wide", page_title="Probability Explorer v2")
 
 # --- Constants & Defaults ---
 DEFAULT_MODEL = "llama3.1-8b"
-CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
+API_BASE_URL = "https://router.huggingface.co/v1"
+API_KEY = "HF_API_KEY"
 
 # --- Session State Initialization ---
 if "history" not in st.session_state:
@@ -57,7 +58,7 @@ def is_continuation(token):
 
 
 def get_client(api_key):
-    return OpenAI(base_url=CEREBRAS_BASE_URL, api_key=api_key)
+    return OpenAI(base_url=API_BASE_URL, api_key=api_key)
 
 
 def apply_sampling_filters(candidates, top_p, top_k):
@@ -185,7 +186,7 @@ def analyze_next_step(api_key, model, temp, top_p, top_k):
         }
 
     except Exception as e:
-        st.error(f"Error calling Cerebras API: {e}")
+        st.error(f"Error calling API: {e}")
 
 
 def fast_forward(api_key, model, temp, top_p, top_k, num_tokens):
@@ -473,10 +474,10 @@ with st.sidebar:
 
     # api_key = st.text_input("Cerebras API Key", type="password")
     # Using secrets instead for security/convenience
-    if "CEREBRAS_API_KEY" in st.secrets:
-        api_key = st.secrets["CEREBRAS_API_KEY"]
+    if API_KEY in st.secrets:
+        api_key = st.secrets[API_KEY]
     else:
-        st.error("CEREBRAS_API_KEY not found in secrets.")
+        st.error("API_KEY not found in secrets.")
         st.stop()
 
     model_name = st.text_input("Model Name", value=DEFAULT_MODEL)
@@ -557,7 +558,7 @@ with st.sidebar:
     if st.session_state.history:
         csv_data = convert_history_to_csv()
         st.download_button(
-            "⬇️ Download Data (CSV)", csv_data, "cerebras_probabilities.csv", "text/csv"
+            "⬇️ Download Data (CSV)", csv_data, "token_probabilities.csv", "text/csv"
         )
     else:
         st.button("⬇️ Download Data (CSV)", disabled=True)
