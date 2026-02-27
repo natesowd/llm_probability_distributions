@@ -94,14 +94,12 @@ def build_llama_prompt():
     sys = st.session_state.system_prompt
     user = st.session_state.user_prompt
 
-    # Construct history string
     assistant_content = ""
     if st.session_state.history:
         assistant_content = "".join(
             [item["token"] for item in st.session_state.history]
         )
 
-    # Llama 3 Format
     prompt = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{sys}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n{assistant_content}"
     return prompt
 
@@ -113,7 +111,7 @@ def build_full_prompt_debug():
 def analyze_next_step(api_key, model, temp, top_p, top_k):
     """
     Runs inference to 'peek' at probabilities.
-    If word_mode is enabled, it looksahead to complete the word.
+    If word_mode is enabled, it looks ahead to complete the word.
     """
     client = get_client(api_key)
     full_prompt = build_llama_prompt()
@@ -204,11 +202,10 @@ def fast_forward(api_key, model, temp, top_p, top_k, num_tokens):
         response = client.chat.completions.create(
             model=model,
             prompt=full_prompt,
-            max__new_tokens=actual_max_tokens,
-            logprobs=5,  # Minimal logprobs for history
+            max_tokens=actual_max_tokens,
+            logprobs=5,
             temperature=temp,
             top_p=top_p,
-            # extra_body={"top_k": top_k},
         )
 
         if response.choices[0].logprobs:
@@ -226,8 +223,6 @@ def fast_forward(api_key, model, temp, top_p, top_k, num_tokens):
             current_word_cands = []
 
             for i, token_str in enumerate(tokens):
-                # top_logprobs_list[i] is a dict {token: lp}
-                # We need to convert it to a list of TokenProb objects
                 current_cands = []
                 if top_logprobs_list and i < len(top_logprobs_list):
                     for t, lp in top_logprobs_list[i].items():
@@ -475,8 +470,7 @@ def tree_rows_to_csv(rows):
 with st.sidebar:
     st.header("⚙️ Configuration")
 
-    # api_key = st.text_input("Cerebras API Key", type="password")
-    # Using secrets instead for security/convenience
+    # Using secrets for security/convenience
     if API_KEY in st.secrets:
         api_key = st.secrets[API_KEY]
     else:
