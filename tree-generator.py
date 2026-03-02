@@ -106,7 +106,18 @@ def _get_candidates(client, model, messages, temperature, top_logprobs, top_p):
 
     top_logprobs (1–5) controls how many candidates the API returns (server-
     side top-k).  top_p is applied client-side afterward as a nucleus filter.
+
+    When the last message has role "assistant", we pass
+    ``continue_final_message=True`` so the API treats it as an incomplete
+    prefix to continue from (rather than a finished turn that triggers a
+    brand-new response).
     """
+    # If the conversation ends with an assistant message, tell the backend
+    # to continue it rather than start a new turn.
+    extra = {}
+    if messages and messages[-1]["role"] == "assistant":
+        extra["continue_final_message"] = True
+
     response = client.chat.completions.create(
         model=model,
         messages=messages,
@@ -114,6 +125,7 @@ def _get_candidates(client, model, messages, temperature, top_logprobs, top_p):
         logprobs=True,
         top_logprobs=top_logprobs,
         temperature=temperature,
+        extra_body=extra,
     )
     choice = response.choices[0]
     candidates = [
