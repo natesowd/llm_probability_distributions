@@ -49,7 +49,7 @@ The API supports:
 
 #### Code snippet example for conversational LLMs
 
-
+```
 import os
 from openai import OpenAI
 
@@ -69,7 +69,7 @@ completion = client.chat.completions.create(
 )
 
 print(completion.choices[0].message)
-
+```
 
 ### API specification
 
