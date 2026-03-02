@@ -1,9 +1,21 @@
 """
 tree-generator.py
 
-Standalone script to exhaustively explore the top-k or top-p token
-probability tree for a given prompt (and optional prior answer) using the
-HuggingFace Chat Completion endpoint (OpenAI-compatible SDK).
+Standalone script to exhaustively explore the token probability tree for a
+given prompt (and optional prior answer) using the HuggingFace Chat Completion
+endpoint (OpenAI-compatible SDK).
+
+The branching factor at each node is controlled by two parameters that can be
+used independently or together:
+
+  top_logprobs (1–5)  Server-side: the API returns this many candidate tokens
+                       per position.  Acts as a hard top-k cap.  The HuggingFace
+                       Chat Completion spec allows values 1–5.
+
+  top_p (0.0–1.0)     Client-side nucleus filter applied *after* the API
+                       returns candidates.  Keeps only the smallest set of
+                       tokens whose cumulative probability >= top_p.  Use 1.0
+                       to disable (keep everything the API returned).
 
 Outputs a CSV with columns:
     Node_ID, Depth, Branch_Context, Candidate_Token, Rank,
@@ -13,7 +25,7 @@ Usage (CLI):
     python tree-generator.py \
         --api-key "$HF_TOKEN" \
         --prompt "Write a haiku about the ocean." \
-        --depth 3 --top-k 5
+        --depth 3 --top-logprobs 5
 
     python tree-generator.py \
         --api-key "$HF_TOKEN" \
@@ -28,7 +40,7 @@ Usage (as a library):
         api_key="hf_...",
         prompt="Write a haiku about the ocean.",
         depth=3,
-        top_k=5,
+        top_logprobs=5,
     )
 """
 
@@ -69,16 +81,12 @@ def _build_messages(system_prompt, user_prompt, assistant_text=""):
     return messages
 
 
-def _apply_sampling_filters(candidates, top_p, top_k):
+def _apply_top_p_filter(candidates, top_p):
     """
-    Apply top-k and top-p (nucleus) filters to a descending-sorted list of
-    TokenProb objects.  Returns the filtered list.
+    Apply top-p (nucleus) filter to a descending-sorted list of TokenProb
+    objects.  Keeps the smallest set whose cumulative probability >= top_p.
+    Returns the filtered list.  Pass top_p=1.0 to disable.
     """
-    # Top-k
-    if top_k and top_k > 0:
-        candidates = candidates[:top_k]
-
-    # Top-p (nucleus): keep tokens whose cumulative probability <= top_p
     if top_p and top_p < 1.0:
         filtered = []
         cumulative = 0.0
@@ -87,24 +95,25 @@ def _apply_sampling_filters(candidates, top_p, top_k):
                 break
             filtered.append(c)
             cumulative += math.exp(c.logprob)
-        candidates = filtered
-
+        return filtered
     return candidates
 
 
-def _get_candidates(client, model, messages, temperature, top_p, top_k):
+def _get_candidates(client, model, messages, temperature, top_logprobs, top_p):
     """
     Call the chat-completion endpoint for a single next token and return a
     sorted, filtered list of TokenProb candidates.
+
+    top_logprobs (1–5) controls how many candidates the API returns (server-
+    side top-k).  top_p is applied client-side afterward as a nucleus filter.
     """
     response = client.chat.completions.create(
         model=model,
         messages=messages,
         max_tokens=1,
         logprobs=True,
-        top_logprobs=20,
+        top_logprobs=top_logprobs,
         temperature=temperature,
-        top_p=top_p,
     )
     choice = response.choices[0]
     candidates = [
@@ -112,7 +121,7 @@ def _get_candidates(client, model, messages, temperature, top_p, top_k):
         for tl in choice.logprobs.content[0].top_logprobs
     ]
     candidates.sort(key=lambda x: x.logprob, reverse=True)
-    return _apply_sampling_filters(candidates, top_p, top_k)
+    return _apply_top_p_filter(candidates, top_p)
 
 
 def _rows_to_csv(rows):
@@ -146,13 +155,20 @@ def generate_tree(
     system_prompt="You are a helpful assistant.",
     model=DEFAULT_MODEL,
     depth=3,
-    top_k=0,
+    top_logprobs=5,
     top_p=1.0,
     temperature=1.0,
 ):
     """
-    Exhaustively explore the token probability tree up to *depth* levels,
-    filtering candidates at each node by top-k and/or top-p.
+    Exhaustively explore the token probability tree up to *depth* levels.
+
+    The branching factor is controlled by two complementary parameters:
+
+      * **top_logprobs** — sent to the API, which returns exactly this many
+        candidate tokens per position (server-side top-k).  Valid range: 1–5.
+      * **top_p** — applied client-side after the API response; keeps only
+        the smallest set of tokens whose cumulative probability >= top_p.
+        Set to 1.0 to disable.
 
     Parameters
     ----------
@@ -169,11 +185,13 @@ def generate_tree(
         HuggingFace model identifier.
     depth : int, optional
         How many token positions deep to explore (default 3).
-    top_k : int, optional
-        Keep only the top-k most-probable tokens at each position.
-        0 means disabled (use all returned candidates).
+    top_logprobs : int, optional
+        Number of most-probable tokens the API should return at each
+        position (1–5).  This is the server-side branching factor.
+        Default 5.
     top_p : float, optional
-        Nucleus-sampling cutoff (0.0–1.0).  1.0 means disabled.
+        Nucleus-sampling cutoff (0.0–1.0).  Applied client-side after
+        receiving candidates.  1.0 means disabled (keep all).
     temperature : float, optional
         Sampling temperature (0.0–2.0).
 
@@ -197,7 +215,7 @@ def generate_tree(
 
         api_calls[0] += 1
         candidates = _get_candidates(
-            client, model, messages, temperature, top_p, top_k
+            client, model, messages, temperature, top_logprobs, top_p
         )
 
         for rank, cand in enumerate(candidates):
@@ -275,8 +293,8 @@ def main():
         help="Tree depth — token positions to explore (default: 3).",
     )
     parser.add_argument(
-        "--top-k", type=int, default=0,
-        help="Top-K filter (0 = disabled, default: 0).",
+        "--top-logprobs", type=int, default=5,
+        help="Candidates per position (1–5, sent to API as top_logprobs). Default: 5.",
     )
     parser.add_argument(
         "--top-p", type=float, default=1.0,
@@ -305,7 +323,7 @@ def main():
         system_prompt=args.system_prompt,
         model=args.model,
         depth=args.depth,
-        top_k=args.top_k,
+        top_logprobs=args.top_logprobs,
         top_p=args.top_p,
         temperature=args.temperature,
     )
