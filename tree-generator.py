@@ -48,6 +48,7 @@ import argparse
 import math
 import os
 import sys
+import time
 from collections import namedtuple
 
 from openai import OpenAI
@@ -99,6 +100,11 @@ def _apply_top_p_filter(candidates, top_p):
     return candidates
 
 
+_INITIAL_BACKOFF = 2      # seconds
+_MAX_BACKOFF = 120        # cap so we don't wait forever
+_BACKOFF_MULTIPLIER = 2
+
+
 def _get_candidates(client, model, messages, temperature, top_logprobs, top_p):
     """
     Call the chat-completion endpoint for a single next token and return a
@@ -111,6 +117,10 @@ def _get_candidates(client, model, messages, temperature, top_logprobs, top_p):
     ``continue_final_message=True`` so the API treats it as an incomplete
     prefix to continue from (rather than a finished turn that triggers a
     brand-new response).
+
+    Retries indefinitely on transient / rate-limit errors with exponential
+    backoff (2 s → 4 s → … → 120 s cap) so long-running generations are
+    never lost to a temporary API hiccup.
     """
     # If the conversation ends with an assistant message, tell the backend
     # to continue it rather than start a new turn.
@@ -118,22 +128,34 @@ def _get_candidates(client, model, messages, temperature, top_logprobs, top_p):
     if messages and messages[-1]["role"] == "assistant":
         extra["continue_final_message"] = True
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        max_tokens=1,
-        logprobs=True,
-        top_logprobs=top_logprobs,
-        temperature=temperature,
-        extra_body=extra,
-    )
-    choice = response.choices[0]
-    candidates = [
-        TokenProb(tl.token, tl.logprob)
-        for tl in choice.logprobs.content[0].top_logprobs
-    ]
-    candidates.sort(key=lambda x: x.logprob, reverse=True)
-    return _apply_top_p_filter(candidates, top_p)
+    backoff = _INITIAL_BACKOFF
+    while True:
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=1,
+                logprobs=True,
+                top_logprobs=top_logprobs,
+                temperature=temperature,
+                extra_body=extra,
+            )
+            choice = response.choices[0]
+            candidates = [
+                TokenProb(tl.token, tl.logprob)
+                for tl in choice.logprobs.content[0].top_logprobs
+            ]
+            candidates.sort(key=lambda x: x.logprob, reverse=True)
+            return _apply_top_p_filter(candidates, top_p)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            print(
+                f"  [retry] API error: {exc}  — retrying in {backoff}s …",
+                file=sys.stderr,
+            )
+            time.sleep(backoff)
+            backoff = min(backoff * _BACKOFF_MULTIPLIER, _MAX_BACKOFF)
 
 
 def _rows_to_csv(rows):
@@ -219,6 +241,28 @@ def generate_tree(
     rows = []
     api_calls = [0]
 
+    # Pre-compute total API calls for the progress display.
+    # Each internal node triggers one API call.  With branching factor k
+    # and depth d the total is k^0 + k^1 + … + k^(d-1) = (k^d - 1)/(k-1).
+    k = top_logprobs  # worst-case branching (top_p may trim some)
+    if k <= 1:
+        total_calls_est = depth
+    else:
+        total_calls_est = (k ** depth - 1) // (k - 1)
+
+    def _progress(node_id, context_snippet):
+        """Print a single-line progress update to stderr."""
+        # Truncate context to keep the line readable.
+        ctx = context_snippet
+        if len(ctx) > 60:
+            ctx = "…" + ctx[-57:]
+        print(
+            f"\r  [{api_calls[0]}/{total_calls_est} calls]  "
+            f"node {node_id}  ctx={ctx!r}",
+            end="",
+            file=sys.stderr,
+        )
+
     def _recurse(current_text, depth_remaining, path, cumulative_logprob):
         if depth_remaining == 0:
             return
@@ -226,6 +270,8 @@ def generate_tree(
         messages = _build_messages(system_prompt, prompt, current_text)
 
         api_calls[0] += 1
+        node_label = path if path else "(root)"
+        _progress(node_label, current_text or "(empty)")
         candidates = _get_candidates(
             client, model, messages, temperature, top_logprobs, top_p
         )
@@ -259,6 +305,8 @@ def generate_tree(
 
     _recurse(answer, depth, "", 0.0)
 
+    # Clear the progress line, then print the final summary.
+    print("", file=sys.stderr)
     print(
         f"Tree complete: {len(rows)} nodes across {depth} depth(s), "
         f"{api_calls[0]} API call(s).",
