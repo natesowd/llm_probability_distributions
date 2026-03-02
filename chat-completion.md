@@ -29,6 +29,7 @@ This is a subtask of [`text-generation`](https://huggingface.co/docs/inference-p
 - [Qwen/Qwen2.5-7B-Instruct-1M](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-1M): Strong conversational model that supports very long instructions.
 - [Qwen/Qwen2.5-Coder-32B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Coder-32B-Instruct): Text generation model used to write code.
 - [deepseek-ai/DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1): Powerful reasoning based open large language model.
+- meta-llama/Llama-3.1-8B-Instruct
 
 #### Conversational Vision-Language Models (VLMs)
 
