@@ -1,2 +1,2 @@
-cerebras_probabilities.csv
+*.csv
 __pycache__/
